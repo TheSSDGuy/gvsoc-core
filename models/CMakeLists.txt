@@ -12,6 +12,7 @@ add_subdirectory(gdbserver)
 add_subdirectory(interco)
 add_subdirectory(memory)
 add_subdirectory(utils)
+add_subdirectory(pcie_vfio_bridge)
 add_subdirectory(vp)
 
 

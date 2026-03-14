@@ -1,8 +1,213 @@
+# -----------------------------------------------------------------------------
+# NOTE ABOUT METADATA REGISTRATION / INHERITANCE
+#
+# This file has been extended to support a configuration flow where the final
+# GVSOC model target name is not always known inside the module-local
+# CMakeLists.txt.
+#
+# In the original flow, helper functions such as:
+#   - vp_model_include_directories()
+#   - vp_model_link_libraries()
+#   - vp_model_link_options()
+#   - vp_model_compile_options()
+#   - vp_model_compile_definitions()
+#
+# directly applied properties to an already-known model name.
+#
+# However, in the config-driven GVSOC build flow, the actual model target is
+# often instantiated later by the top-level CMake logic through:
+#
+#   vp_model(NAME ${component} SOURCES "${SRCS_LIST}")
+#
+# where `${component}` is derived from the generated GVSOC configuration
+# (e.g. gapy/gvrun output), and may differ from the logical name used inside
+# the module-local CMakeLists.txt.
+#
+# This creates a practical issue for out-of-tree or custom modules: the module
+# knows its own sources and external dependencies, but it does not necessarily
+# know the final target name selected by the top-level configuration flow.
+#
+# To solve this cleanly without patching the root CMakeLists, this file now
+# supports a two-step mechanism:
+#
+#   1) Metadata registration
+#      Module-local helper calls always register build metadata
+#      (sources, include directories, link libraries, link options, compile
+#      options, compile definitions) in a global CMake registry, even if the
+#      final target is not created yet.
+#
+#   2) Metadata inheritance
+#      When vp_model() is later called by the top-level flow to instantiate the
+#      real model target, the implementation compares the model sources against
+#      the previously registered module sources. If a match is found, the
+#      registered metadata is automatically applied to the real target.
+#
+# The matching is currently performed by source file basename. This keeps the
+# mechanism simple and minimally invasive, while being sufficient for modules
+# whose source filenames are unique within the build.
+#
+# The main goal of this extension is to let each module describe its own build
+# requirements locally, while preserving the existing top-level GVSOC
+# configuration flow unchanged.
+# -----------------------------------------------------------------------------
+
 if(POLICY CMP0177)
     cmake_policy(SET CMP0177 NEW)
 endif()
 
 set(VP_TARGET_TYPES "" CACHE INTERNAL "contains the types of target")
+
+# -----------------------------------------------------------------------------
+# Internal registry helpers
+# -----------------------------------------------------------------------------
+
+function(_vp_append_global_property prop)
+    foreach(item IN LISTS ARGN)
+        if(NOT "${item}" STREQUAL "")
+            set_property(GLOBAL APPEND PROPERTY ${prop} "${item}")
+        endif()
+    endforeach()
+endfunction()
+
+function(_vp_set_model_property name suffix)
+    set(prop "VP_MODEL_PROP_${suffix}_${name}")
+    set_property(GLOBAL PROPERTY ${prop} "${ARGN}")
+endfunction()
+
+function(_vp_get_model_property out name suffix)
+    set(prop "VP_MODEL_PROP_${suffix}_${name}")
+    get_property(val GLOBAL PROPERTY ${prop})
+    if(NOT val)
+        set(val "")
+    endif()
+    set(${out} "${val}" PARENT_SCOPE)
+endfunction()
+
+function(_vp_register_model_metadata name)
+    cmake_parse_arguments(
+        VP_META
+        ""
+        ""
+        "SOURCES;INCLUDE_DIRS;LINK_LIBS;LINK_OPTIONS;COMPILE_OPTIONS;COMPILE_DEFINITIONS"
+        ${ARGN}
+    )
+
+    get_property(_registered GLOBAL PROPERTY VP_MODEL_REGISTERED_NAMES)
+    if(NOT _registered)
+        set(_registered "")
+    endif()
+
+    list(FIND _registered "${name}" _idx)
+    if(_idx EQUAL -1)
+        set_property(GLOBAL APPEND PROPERTY VP_MODEL_REGISTERED_NAMES "${name}")
+    endif()
+
+    if(VP_META_SOURCES)
+        _vp_set_model_property("${name}" "SOURCES" "${VP_META_SOURCES}")
+    endif()
+
+    if(VP_META_INCLUDE_DIRS)
+        _vp_append_global_property("VP_MODEL_PROP_INCLUDE_DIRS_${name}" ${VP_META_INCLUDE_DIRS})
+    endif()
+
+    if(VP_META_LINK_LIBS)
+        _vp_append_global_property("VP_MODEL_PROP_LINK_LIBS_${name}" ${VP_META_LINK_LIBS})
+    endif()
+
+    if(VP_META_LINK_OPTIONS)
+        _vp_append_global_property("VP_MODEL_PROP_LINK_OPTIONS_${name}" ${VP_META_LINK_OPTIONS})
+    endif()
+
+    if(VP_META_COMPILE_OPTIONS)
+        _vp_append_global_property("VP_MODEL_PROP_COMPILE_OPTIONS_${name}" ${VP_META_COMPILE_OPTIONS})
+    endif()
+
+    if(VP_META_COMPILE_DEFINITIONS)
+        _vp_append_global_property("VP_MODEL_PROP_COMPILE_DEFINITIONS_${name}" ${VP_META_COMPILE_DEFINITIONS})
+    endif()
+endfunction()
+
+function(_vp_lists_match_by_basename out list_a list_b)
+    set(_match FALSE)
+
+    foreach(_a IN LISTS list_a)
+        get_filename_component(_a_name "${_a}" NAME)
+        foreach(_b IN LISTS list_b)
+            get_filename_component(_b_name "${_b}" NAME)
+            if(_a_name STREQUAL _b_name)
+                set(_match TRUE)
+            endif()
+        endforeach()
+    endforeach()
+
+    set(${out} ${_match} PARENT_SCOPE)
+endfunction()
+
+function(_vp_inherit_registered_metadata model_name)
+    cmake_parse_arguments(
+        VP_INHERIT
+        ""
+        ""
+        "SOURCES"
+        ${ARGN}
+    )
+
+    get_property(_registered GLOBAL PROPERTY VP_MODEL_REGISTERED_NAMES)
+    if(NOT _registered)
+        return()
+    endif()
+
+    foreach(_registered_name IN LISTS _registered)
+        # Do not try to inherit from self
+        if(_registered_name STREQUAL "${model_name}")
+            continue()
+        endif()
+
+        _vp_get_model_property(_registered_sources "${_registered_name}" "SOURCES")
+
+        if(NOT _registered_sources)
+            continue()
+        endif()
+
+        _vp_lists_match_by_basename(_matched "${VP_INHERIT_SOURCES}" "${_registered_sources}")
+
+        if(NOT _matched)
+            continue()
+        endif()
+
+        get_property(_include_dirs GLOBAL PROPERTY "VP_MODEL_PROP_INCLUDE_DIRS_${_registered_name}")
+        get_property(_link_libs    GLOBAL PROPERTY "VP_MODEL_PROP_LINK_LIBS_${_registered_name}")
+        get_property(_link_opts    GLOBAL PROPERTY "VP_MODEL_PROP_LINK_OPTIONS_${_registered_name}")
+        get_property(_copts        GLOBAL PROPERTY "VP_MODEL_PROP_COMPILE_OPTIONS_${_registered_name}")
+        get_property(_cdefs        GLOBAL PROPERTY "VP_MODEL_PROP_COMPILE_DEFINITIONS_${_registered_name}")
+
+        if(_include_dirs)
+            vp_model_include_directories(NAME ${model_name} DIRECTORY ${_include_dirs} FORCE_BUILD 1)
+        endif()
+
+        if(_link_opts)
+            vp_model_link_options(NAME ${model_name} OPTIONS ${_link_opts} FORCE_BUILD 1)
+        endif()
+
+        if(_link_libs)
+            foreach(_lib IN LISTS _link_libs)
+                vp_model_link_libraries(NAME ${model_name} LIBRARY ${_lib} FORCE_BUILD 1)
+            endforeach()
+        endif()
+
+        if(_copts)
+            vp_model_compile_options(NAME ${model_name} OPTIONS ${_copts} FORCE_BUILD 1)
+        endif()
+
+        if(_cdefs)
+            vp_model_compile_definitions(NAME ${model_name} DEFINITIONS ${_cdefs} FORCE_BUILD 1)
+        endif()
+    endforeach()
+endfunction()
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 
 function(vp_set_target_types)
     cmake_parse_arguments(
@@ -236,6 +441,12 @@ function(vp_model)
         )
     #message(STATUS "vp_model: name=\"${VP_MODEL_NAME}\", output_name=\"${VP_MODEL_OUTPUT_NAME}\" prefix=\"${VP_MODEL_DIRECTORY}\", srcs=\"${VP_MODEL_SOURCES}\", incs=\"${VP_MODEL_INCLUDES}\"")
 
+    # Always register metadata so child modules can declare properties even if
+    # the actual target will be instantiated later by the top-level config flow.
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        SOURCES "${VP_MODEL_SOURCES}"
+    )
+
     string(REPLACE "." "/" VP_MODEL_PATH ${VP_MODEL_NAME})
 
     get_filename_component(VP_MODEL_FILENAME ${VP_MODEL_PATH} NAME)
@@ -424,6 +635,12 @@ function(vp_model)
             endforeach()
         endif()
 
+        # Inherit metadata declared by child modules which registered the same
+        # model sources under a logical name.
+        _vp_inherit_registered_metadata(${VP_MODEL_NAME}
+            SOURCES "${VP_MODEL_SOURCES}"
+        )
+
     endif()
 endfunction()
 
@@ -475,10 +692,15 @@ function(vp_model_link_libraries)
         ${ARGN}
         )
 
-        if(TARGET_TYPES)
-        else()
-            set(TARGET_TYPES ${VP_TARGET_TYPES})
-        endif()
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        LINK_LIBS "${VP_MODEL_LIBRARY}"
+    )
+
+    if(TARGET_TYPES)
+    else()
+        set(TARGET_TYPES ${VP_TARGET_TYPES})
+    endif()
 
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
@@ -517,6 +739,11 @@ function(vp_model_compile_options)
         ${ARGN}
         )
 
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        COMPILE_OPTIONS "${VP_MODEL_OPTIONS}"
+    )
+
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
             set(VP_MODEL_NAME_TYPE "${VP_MODEL_NAME}${TARGET_TYPE}")
@@ -534,6 +761,11 @@ function(vp_model_link_options)
         ${ARGN}
         )
 
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        LINK_OPTIONS "${VP_MODEL_OPTIONS}"
+    )
+
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
             set(VP_MODEL_NAME_TYPE "${VP_MODEL_NAME}${TARGET_TYPE}")
@@ -546,10 +778,15 @@ function(vp_model_compile_definitions)
     cmake_parse_arguments(
         VP_MODEL
         ""
-        "NAME;"
+        "NAME;FORCE_BUILD;"
         "DEFINITIONS"
         ${ARGN}
         )
+
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        COMPILE_DEFINITIONS "${VP_MODEL_DEFINITIONS}"
+    )
 
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
@@ -568,6 +805,11 @@ function(vp_model_include_directories)
         ${ARGN}
         )
 
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        INCLUDE_DIRS "${VP_MODEL_DIRECTORY}"
+    )
+
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
             set(VP_MODEL_NAME_TYPE "${VP_MODEL_NAME}${TARGET_TYPE}")
@@ -584,6 +826,11 @@ function(vp_model_sources)
         "SOURCES"
         ${ARGN}
         )
+
+    # Always register metadata
+    _vp_register_model_metadata(${VP_MODEL_NAME}
+        SOURCES "${VP_MODEL_SOURCES}"
+    )
 
     if ("${CONFIG_${VP_MODEL_NAME}}" EQUAL "1" OR DEFINED CONFIG_BUILD_ALL OR DEFINED VP_MODEL_FORCE_BUILD)
         foreach (TARGET_TYPE IN LISTS VP_TARGET_TYPES)
