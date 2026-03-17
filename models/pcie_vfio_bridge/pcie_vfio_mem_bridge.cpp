@@ -19,7 +19,8 @@
  *
  * Phase 1 notes:
  * - BAR0 is the DMA control BAR and also hosts a tiny MSI-X table/PBA area.
- * - BAR2 is the emulated card-local memory window.
+ * - Only BAR0 is exposed over PCIe.
+ * - Device-local memory is kept private inside the model as backing storage.
  * - DMA execution is never performed inside the BAR0 MMIO callback.
  * - The BAR0 callback only latches a pending DMA request.
  * - The VFIO server thread runs in non-blocking attach mode, uses poll(),
@@ -27,6 +28,8 @@
  *   MMIO callback path.
  * - Completion is reported through BAR0 status bits and optionally via MSI-X
  *   vector 0 when DMA_CTRL_IRQ_EN is set.
+ * - The DMA engine interprets one endpoint of the transfer as a host IOVA and
+ *   the other endpoint as an offset inside the private device-local memory.
  *
  * Important note:
  * - This implementation does NOT use any vfu_sgl_* API.
@@ -84,10 +87,10 @@ private:
     vfu_ctx_t *vfu_ctx = nullptr;
 
     uint64_t bar0_size = 0;
-    uint64_t bar2_size = 0;
+    uint64_t device_mem_size = 0;
 
     std::vector<uint8_t> bar0;
-    std::vector<uint8_t> bar2;
+    std::vector<uint8_t> device_mem;
 
     std::string socket_path;
     std::mutex mutex;
@@ -194,12 +197,6 @@ private:
                                loff_t offset,
                                bool is_write);
 
-    static ssize_t bar2_access(vfu_ctx_t *vfu_ctx,
-                               char *buf,
-                               size_t count,
-                               loff_t offset,
-                               bool is_write);
-
     static int device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type);
     static void dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info);
     static void dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info);
@@ -215,8 +212,8 @@ private:
     void clear_dma_status_nolock();
     void schedule_dma_from_regs_nolock();
     int execute_dma_from_request(const PendingDma &req);
-    int dma_copy_host_to_card(uint64_t host_addr, uint64_t card_addr, uint32_t len);
-    int dma_copy_card_to_host(uint64_t card_addr, uint64_t host_addr, uint32_t len);
+    int dma_copy_host_to_device(uint64_t host_addr, uint64_t device_addr, uint32_t len);
+    int dma_copy_device_to_host(uint64_t device_addr, uint64_t host_addr, uint32_t len);
     uint8_t *get_host_ptr_nolock(uint64_t iova, uint32_t len, int prot);
 };
 
@@ -231,15 +228,15 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
     this->new_master_port("entry_addr", &this->entry_addr_itf);
 
     this->socket_path = this->get_js_config()->get_child_str("socket_path");
-    this->bar0_size   = this->get_js_config()->get_child_int("bar0_size");
-    this->bar2_size   = this->get_js_config()->get_child_int("bar2_size");
+    this->bar0_size      = this->get_js_config()->get_child_int("bar0_size");
+    this->device_mem_size = this->get_js_config()->get_child_int("bar2_size");
 
     if (bar0_size < 0x100) {
         throw std::runtime_error("bar0_size must be at least 0x100 for DMA control/MSI-X registers");
     }
 
     bar0.resize(bar0_size, 0);
-    bar2.resize(bar2_size, 0);
+    device_mem.resize(device_mem_size, 0);
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -313,18 +310,6 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
                          -1,
                          0) < 0) {
         throw std::runtime_error("vfu_setup_region BAR0 failed");
-    }
-
-    if (vfu_setup_region(vfu_ctx,
-                         VFU_PCI_DEV_BAR2_REGION_IDX,
-                         bar2_size,
-                         bar2_access,
-                         VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
-                         NULL,
-                         0,
-                         -1,
-                         0) < 0) {
-        throw std::runtime_error("vfu_setup_region BAR2 failed");
     }
 
     if (vfu_realize_ctx(vfu_ctx) < 0) {
@@ -486,14 +471,14 @@ vp::IoReqStatus PCIeVfioMemBridge::req(vp::Block *__this, vp::IoReq *req)
     uint8_t *data = req->get_data();
     size_t size = req->get_size();
 
-    if (addr + size > _this->bar2.size()) {
+    if (addr + size > _this->device_mem.size()) {
         return vp::IO_REQ_INVALID;
     }
 
     if (req->get_is_write()) {
-        std::memcpy(&_this->bar2[addr], data, size);
+        std::memcpy(&_this->device_mem[addr], data, size);
     } else {
-        std::memcpy(data, &_this->bar2[addr], size);
+        std::memcpy(data, &_this->device_mem[addr], size);
     }
 
     return vp::IO_REQ_OK;
@@ -523,12 +508,12 @@ uint8_t *PCIeVfioMemBridge::get_host_ptr_nolock(uint64_t iova, uint32_t len, int
     return nullptr;
 }
 
-int PCIeVfioMemBridge::dma_copy_host_to_card(uint64_t host_addr,
-                                             uint64_t card_addr,
-                                             uint32_t len)
+int PCIeVfioMemBridge::dma_copy_host_to_device(uint64_t host_addr,
+                                               uint64_t device_addr,
+                                               uint32_t len)
 {
-    std::cout << "DMA H2C start: host=0x" << std::hex << host_addr
-              << " card=0x" << card_addr
+    std::cout << "DMA H2D start: host=0x" << std::hex << host_addr
+              << " device=0x" << device_addr
               << " len=0x" << len
               << std::dec << std::endl;
 
@@ -540,7 +525,7 @@ int PCIeVfioMemBridge::dma_copy_host_to_card(uint64_t host_addr,
 
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (card_addr + len > bar2.size()) {
+    if (device_addr + len > device_mem.size()) {
         write32_nolock(BAR0_DMA_ERROR, DMA_ERR_CARD_RANGE);
         return -1;
     }
@@ -548,22 +533,22 @@ int PCIeVfioMemBridge::dma_copy_host_to_card(uint64_t host_addr,
     errno = 0;
     uint8_t *host_ptr = get_host_ptr_nolock(host_addr, len, PROT_READ);
     if (host_ptr == nullptr) {
-        std::cout << "DMA H2C get_host_ptr failed errno=" << errno << std::endl;
+        std::cout << "DMA H2D get_host_ptr failed errno=" << errno << std::endl;
         write32_nolock(BAR0_DMA_ERROR, errno == EACCES ? DMA_ERR_HOST_PERM : DMA_ERR_HOST_ADDR);
         return -1;
     }
 
-    std::memcpy(&bar2[card_addr], host_ptr, len);
+    std::memcpy(&device_mem[device_addr], host_ptr, len);
 
-    std::cout << "DMA H2C done via direct mapping" << std::endl;
+    std::cout << "DMA H2D done via direct mapping" << std::endl;
     return 0;
 }
 
-int PCIeVfioMemBridge::dma_copy_card_to_host(uint64_t card_addr,
-                                             uint64_t host_addr,
-                                             uint32_t len)
+int PCIeVfioMemBridge::dma_copy_device_to_host(uint64_t device_addr,
+                                               uint64_t host_addr,
+                                               uint32_t len)
 {
-    std::cout << "DMA C2H start: card=0x" << std::hex << card_addr
+    std::cout << "DMA D2H start: device=0x" << std::hex << device_addr
               << " host=0x" << host_addr
               << " len=0x" << len
               << std::dec << std::endl;
@@ -576,7 +561,7 @@ int PCIeVfioMemBridge::dma_copy_card_to_host(uint64_t card_addr,
 
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (card_addr + len > bar2.size()) {
+    if (device_addr + len > device_mem.size()) {
         write32_nolock(BAR0_DMA_ERROR, DMA_ERR_CARD_RANGE);
         return -1;
     }
@@ -584,14 +569,14 @@ int PCIeVfioMemBridge::dma_copy_card_to_host(uint64_t card_addr,
     errno = 0;
     uint8_t *host_ptr = get_host_ptr_nolock(host_addr, len, PROT_WRITE);
     if (host_ptr == nullptr) {
-        std::cout << "DMA C2H get_host_ptr failed errno=" << errno << std::endl;
+        std::cout << "DMA D2H get_host_ptr failed errno=" << errno << std::endl;
         write32_nolock(BAR0_DMA_ERROR, errno == EACCES ? DMA_ERR_HOST_PERM : DMA_ERR_HOST_ADDR);
         return -1;
     }
 
-    std::memcpy(host_ptr, &bar2[card_addr], len);
+    std::memcpy(host_ptr, &device_mem[device_addr], len);
 
-    std::cout << "DMA C2H done via direct mapping" << std::endl;
+    std::cout << "DMA D2H done via direct mapping" << std::endl;
     return 0;
 }
 
@@ -599,10 +584,10 @@ int PCIeVfioMemBridge::execute_dma_from_request(const PendingDma &req)
 {
     switch (req.direction) {
         case DMA_DIR_HOST_TO_CARD:
-            return dma_copy_host_to_card(req.src_addr, req.dst_addr, req.len);
+            return dma_copy_host_to_device(req.src_addr, req.dst_addr, req.len);
 
         case DMA_DIR_CARD_TO_HOST:
-            return dma_copy_card_to_host(req.src_addr, req.dst_addr, req.len);
+            return dma_copy_device_to_host(req.src_addr, req.dst_addr, req.len);
 
         default:
         {
@@ -715,28 +700,6 @@ ssize_t PCIeVfioMemBridge::bar0_access(vfu_ctx_t *vfu_ctx,
     return static_cast<ssize_t>(count);
 }
 
-ssize_t PCIeVfioMemBridge::bar2_access(vfu_ctx_t *vfu_ctx,
-                                       char *buf,
-                                       size_t count,
-                                       loff_t offset,
-                                       bool is_write)
-{
-    PCIeVfioMemBridge *bridge = static_cast<PCIeVfioMemBridge *>(vfu_get_private(vfu_ctx));
-    std::lock_guard<std::mutex> lock(bridge->mutex);
-
-    if (offset + count > bridge->bar2.size()) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (is_write) {
-        std::memcpy(&bridge->bar2[offset], buf, count);
-    } else {
-        std::memcpy(buf, &bridge->bar2[offset], count);
-    }
-
-    return static_cast<ssize_t>(count);
-}
 
 void PCIeVfioMemBridge::vfio_server_thread()
 {
