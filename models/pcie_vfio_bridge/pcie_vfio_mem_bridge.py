@@ -16,7 +16,8 @@ class PCIeVfioMemBridge(gvsoc.systree.Component):
             'bar0_size': bar0_size,
         })
 
-        self.add_sources(['pcie_vfio_bridge/pcie_vfio_mem_bridge.cpp'])
+        #self.add_sources(['pcie_vfio_bridge/pcie_vfio_mem_bridge.cpp'])
+        self.set_component('pcie_vfio_bridge.pcie_vfio_mem_bridge')
 
     def i_IRQ_DONE(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'done_irq', signature='wire<bool>')
