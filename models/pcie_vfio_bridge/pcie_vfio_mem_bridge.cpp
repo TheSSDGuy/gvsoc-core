@@ -28,11 +28,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#include <condition_variable>
 
 #ifndef _Static_assert
 #define _Static_assert static_assert
@@ -145,6 +145,9 @@ private:
     static constexpr uint32_t MSIX_TABLE_OFFSET = BAR0_MSIX_TABLE_OFF;
     static constexpr uint32_t MSIX_PBA_OFFSET   = BAR0_MSIX_PBA_OFF;
     static constexpr uint32_t NUM_MSIX_VECTORS  = 1;
+    static constexpr int VFIO_ATTACH_RETRY_US = 1000;
+    static constexpr int VFIO_POLL_TIMEOUT_ATTACHED_MS = 1;
+    static constexpr int VFIO_POLL_TIMEOUT_DETACHED_MS = 50;
 
     vp::Trace trace;
     vp::IoMaster mem_itf;
@@ -168,8 +171,7 @@ private:
     bool entry_update_pending = false;
     bool fetch_update_pending = false;
     bool irq_pending = false;
-
-    static constexpr int VFIO_ATTACH_RETRY_US = 1000;
+    bool reset_pending = false;
 
     PendingDma pending_dma;
     PendingDma active_dma;
@@ -177,6 +179,7 @@ private:
     std::vector<DmaMapping> dma_mappings;
 
     vp::ClockEvent *kick_event = nullptr;
+    vp::ClockEvent *reset_event = nullptr;
     vp::IoReq dma_req;
 
     static ssize_t bar0_access(vfu_ctx_t *vfu_ctx,
@@ -189,6 +192,7 @@ private:
     static void dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info);
     static void irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_t count, bool mask);
     static void kick_handler(vp::Block *__this, vp::ClockEvent *event);
+    static void reset_handler(vp::Block *__this, vp::ClockEvent *event);
     static void mem_response(vp::Block *__this, vp::IoReq *req);
     static void done_req(vp::Block *__this, bool active);
 
@@ -200,8 +204,10 @@ private:
     void stop_vfio();
     void vfio_server_thread();
     void schedule_kick_event();
+    void schedule_reset_event();
     void process_kick();
     void process_pending_irq();
+    void trigger_system_reset();
 
     uint32_t read32_nolock(uint64_t offset) const;
     void write32_nolock(uint64_t offset, uint32_t value);
@@ -215,6 +221,7 @@ private:
     void launch_dma(const PendingDma &req);
 };
 
+/* Build the bridge component, expose GVSoC interfaces and initialize software-visible state. */
 PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
 : vp::Component(conf)
 {
@@ -242,13 +249,16 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
     }
 
     this->kick_event = this->event_new(&PCIeVfioMemBridge::kick_handler);
+    this->reset_event = this->event_new(&PCIeVfioMemBridge::reset_handler);
 }
 
+/* Stop background activity and release VFIO resources when the component is destroyed. */
 PCIeVfioMemBridge::~PCIeVfioMemBridge()
 {
     this->stop_vfio();
 }
 
+/* Start the VFIO transport and wait until a client is attached or the component is stopped. */
 void PCIeVfioMemBridge::start()
 {
     this->init_vfio();
@@ -261,11 +271,13 @@ void PCIeVfioMemBridge::start()
     }
 }
 
+/* Stop the VFIO side when the simulator is shutting down. */
 void PCIeVfioMemBridge::stop()
 {
     this->stop_vfio();
 }
 
+/* Restore bridge-local runtime state when the GVSoC reset line is asserted. */
 void PCIeVfioMemBridge::reset(bool active)
 {
     if (!active) {
@@ -274,12 +286,14 @@ void PCIeVfioMemBridge::reset(bool active)
         this->entry_update_pending = false;
         this->fetch_update_pending = false;
         this->irq_pending = false;
+        this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
         this->dma_inflight = false;
     }
 }
 
+/* Create and realize the libvfio-user context, then launch the transport thread. */
 void PCIeVfioMemBridge::init_vfio()
 {
     std::lock_guard<std::mutex> lock(this->mutex);
@@ -372,6 +386,7 @@ void PCIeVfioMemBridge::init_vfio()
     this->server_thread_started = true;
 }
 
+/* Tear down the VFIO transport thread and release all transport-owned state. */
 void PCIeVfioMemBridge::stop_vfio()
 {
     std::thread local_thread;
@@ -399,6 +414,7 @@ void PCIeVfioMemBridge::stop_vfio()
         this->entry_update_pending = false;
         this->fetch_update_pending = false;
         this->irq_pending = false;
+        this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
         this->dma_inflight = false;
@@ -414,6 +430,7 @@ void PCIeVfioMemBridge::stop_vfio()
     }
 }
 
+/* Read a 32-bit BAR register from the software shadow without taking any lock. */
 uint32_t PCIeVfioMemBridge::read32_nolock(uint64_t offset) const
 {
     uint32_t value = 0;
@@ -421,11 +438,13 @@ uint32_t PCIeVfioMemBridge::read32_nolock(uint64_t offset) const
     return value;
 }
 
+/* Write a 32-bit BAR register into the software shadow without taking any lock. */
 void PCIeVfioMemBridge::write32_nolock(uint64_t offset, uint32_t value)
 {
     std::memcpy(&this->bar0.at(offset), &value, sizeof(value));
 }
 
+/* Snapshot all DMA control registers from BAR0 into a convenient structure. */
 PCIeVfioMemBridge::DmaRegs PCIeVfioMemBridge::snapshot_dma_regs_nolock() const
 {
     DmaRegs regs;
@@ -442,6 +461,7 @@ PCIeVfioMemBridge::DmaRegs PCIeVfioMemBridge::snapshot_dma_regs_nolock() const
     return regs;
 }
 
+/* Restore the BAR shadow and local execution state to their reset values. */
 void PCIeVfioMemBridge::reset_registers_nolock()
 {
     std::fill(this->bar0.begin(), this->bar0.end(), 0);
@@ -457,12 +477,14 @@ void PCIeVfioMemBridge::reset_registers_nolock()
     this->msix_vector0_masked = false;
 }
 
+/* Clear DMA completion/error bits before accepting a new transfer. */
 void PCIeVfioMemBridge::clear_dma_status_nolock()
 {
     this->write32_nolock(BAR0_DMA_STATUS, 0);
     this->write32_nolock(BAR0_DMA_ERROR, DMA_ERR_NONE);
 }
 
+/* Latch a DMA request from BAR0 so that it can later be executed from the GVSoC thread. */
 bool PCIeVfioMemBridge::schedule_dma_from_regs_nolock()
 {
     DmaRegs regs = this->snapshot_dma_regs_nolock();
@@ -495,6 +517,7 @@ bool PCIeVfioMemBridge::schedule_dma_from_regs_nolock()
     return true;
 }
 
+/* Resolve a guest IOVA to a host pointer using the mappings provided by libvfio-user. */
 uint8_t *PCIeVfioMemBridge::get_host_ptr_nolock(uint64_t iova, uint32_t len, int prot)
 {
     const uint64_t end = iova + static_cast<uint64_t>(len);
@@ -520,6 +543,7 @@ uint8_t *PCIeVfioMemBridge::get_host_ptr_nolock(uint64_t iova, uint32_t len, int
     return nullptr;
 }
 
+/* Mark the current DMA as completed successfully and optionally queue an interrupt. */
 void PCIeVfioMemBridge::finish_dma_success(uint32_t ctrl)
 {
     std::lock_guard<std::mutex> lock(this->mutex);
@@ -532,6 +556,7 @@ void PCIeVfioMemBridge::finish_dma_success(uint32_t ctrl)
     }
 }
 
+/* Mark the current DMA as failed and optionally queue an interrupt. */
 void PCIeVfioMemBridge::finish_dma_error(uint32_t ctrl, uint32_t error)
 {
     std::lock_guard<std::mutex> lock(this->mutex);
@@ -544,6 +569,7 @@ void PCIeVfioMemBridge::finish_dma_error(uint32_t ctrl, uint32_t error)
     }
 }
 
+/* Translate one latched DMA request into a GVSoC IO request on the memory port. */
 void PCIeVfioMemBridge::launch_dma(const PendingDma &req)
 {
     if (req.len == 0) {
@@ -612,6 +638,7 @@ void PCIeVfioMemBridge::launch_dma(const PendingDma &req)
     }
 }
 
+/* Handle a VFIO reset request by restoring bridge state visible to the guest. */
 int PCIeVfioMemBridge::device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 {
     PCIeVfioMemBridge *bridge = static_cast<PCIeVfioMemBridge *>(vfu_get_private(vfu_ctx));
@@ -623,10 +650,12 @@ int PCIeVfioMemBridge::device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
     bridge->entry_update_pending = false;
     bridge->fetch_update_pending = false;
     bridge->irq_pending = false;
+    bridge->reset_pending = false;
 
     return 0;
 }
 
+/* Remember a new DMA mapping exported by the VFIO client. */
 void PCIeVfioMemBridge::dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     PCIeVfioMemBridge *bridge = static_cast<PCIeVfioMemBridge *>(vfu_get_private(vfu_ctx));
@@ -646,6 +675,7 @@ void PCIeVfioMemBridge::dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info
                       mapping.prot);
 }
 
+/* Forget a DMA mapping that has been removed by the VFIO client. */
 void PCIeVfioMemBridge::dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     PCIeVfioMemBridge *bridge = static_cast<PCIeVfioMemBridge *>(vfu_get_private(vfu_ctx));
@@ -668,6 +698,7 @@ void PCIeVfioMemBridge::dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *in
                       (unsigned long long)size);
 }
 
+/* Track whether MSI-X vector 0 is currently masked by the guest. */
 void PCIeVfioMemBridge::irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_t count, bool mask)
 {
     PCIeVfioMemBridge *bridge = static_cast<PCIeVfioMemBridge *>(vfu_get_private(vfu_ctx));
@@ -681,6 +712,7 @@ void PCIeVfioMemBridge::irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_
     }
 }
 
+/* Wake the GVSoC thread so it can process BAR-driven work from the VFIO thread. */
 void PCIeVfioMemBridge::schedule_kick_event()
 {
     gv::Controller::get().engine_lock();
@@ -690,12 +722,29 @@ void PCIeVfioMemBridge::schedule_kick_event()
     gv::Controller::get().engine_unlock();
 }
 
+/* Wake the GVSoC thread so it can issue a global reset outside of the IRQ callback path. */
+void PCIeVfioMemBridge::schedule_reset_event()
+{
+    if (this->reset_event != nullptr && !this->reset_event->is_enqueued()) {
+        this->event_enqueue(this->reset_event, 1);
+    }
+}
+
+/* Dispatch pending BAR-triggered actions from the GVSoC thread context. */
 void PCIeVfioMemBridge::kick_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
     _this->process_kick();
 }
 
+/* Execute the deferred global reset from the GVSoC thread context. */
+void PCIeVfioMemBridge::reset_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
+    _this->trigger_system_reset();
+}
+
+/* Consume deferred entry/fetch/DMA updates that were latched by BAR callbacks. */
 void PCIeVfioMemBridge::process_kick()
 {
     PendingDma dma_req;
@@ -735,6 +784,29 @@ void PCIeVfioMemBridge::process_kick()
     }
 }
 
+/* Reset the whole GVSoC hierarchy by asserting and releasing the top-level reset. */
+void PCIeVfioMemBridge::trigger_system_reset()
+{
+    {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        if (!this->reset_pending) {
+            return;
+        }
+        this->reset_pending = false;
+    }
+
+    this->trace.msg(vp::Trace::LEVEL_INFO, "Triggering full GVSoC reset after done IRQ\n");
+
+    vp::Block *top = this;
+    while (top->get_parent() != nullptr) {
+        top = top->get_parent();
+    }
+
+    top->reset_all(true);
+    top->reset_all(false);
+}
+
+/* Complete an asynchronous memory request when the target answers on the IO port. */
 void PCIeVfioMemBridge::mem_response(vp::Block *__this, vp::IoReq *req)
 {
     PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
@@ -748,6 +820,7 @@ void PCIeVfioMemBridge::mem_response(vp::Block *__this, vp::IoReq *req)
     _this->finish_dma_success(active.ctrl);
 }
 
+/* Emit a pending MSI-X interrupt once the VFIO transport is ready to accept it. */
 void PCIeVfioMemBridge::process_pending_irq()
 {
     bool trigger = false;
@@ -772,15 +845,26 @@ void PCIeVfioMemBridge::process_pending_irq()
     }
 }
 
+/* React to the accelerator completion IRQ by disabling fetch and requesting a full reset. */
 void PCIeVfioMemBridge::done_req(vp::Block *__this, bool active)
 {
     PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
-    if (active) {
-        _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received end of compute from accelerator\n");
-        _this->fetch_enable_itf.sync(false);
+    if (!active) {
+        return;
     }
+
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received end of compute from accelerator\n");
+    _this->fetch_enable_itf.sync(false);
+
+    {
+        std::lock_guard<std::mutex> lock(_this->mutex);
+        _this->reset_pending = true;
+    }
+
+    _this->schedule_reset_event();
 }
 
+/* Serve guest BAR0 MMIO accesses and defer any GVSoC-side work to the simulator thread. */
 ssize_t PCIeVfioMemBridge::bar0_access(vfu_ctx_t *vfu_ctx,
                                        char *buf,
                                        size_t count,
@@ -853,6 +937,7 @@ ssize_t PCIeVfioMemBridge::bar0_access(vfu_ctx_t *vfu_ctx,
     return static_cast<ssize_t>(count);
 }
 
+/* Run the libvfio-user event loop, handling attach, transport polling and disconnects. */
 void PCIeVfioMemBridge::vfio_server_thread()
 {
     bool attached = false;
@@ -889,7 +974,7 @@ void PCIeVfioMemBridge::vfio_server_thread()
         int fd = vfu_get_poll_fd(this->vfu_ctx);
         if (fd < 0) {
             // No poll fd is available yet: back off a little to avoid spinning
-            // while the transport is still in an attach/re-attach transition.
+            // while the transport is still transitioning through attach/re-attach.
             usleep(VFIO_ATTACH_RETRY_US);
             continue;
         }
@@ -899,7 +984,8 @@ void PCIeVfioMemBridge::vfio_server_thread()
         pfd.events = POLLIN;
         pfd.revents = 0;
 
-        int timeout_ms = attached ? 1 : 50;
+        const int timeout_ms = attached ? VFIO_POLL_TIMEOUT_ATTACHED_MS
+                                        : VFIO_POLL_TIMEOUT_DETACHED_MS;
         int pret = poll(&pfd, 1, timeout_ms);
         if (pret < 0) {
             if (errno == EINTR) {
@@ -924,10 +1010,11 @@ void PCIeVfioMemBridge::vfio_server_thread()
                 attached = false;
                 std::lock_guard<std::mutex> lock(this->mutex);
                 this->connected = false;
-                this->pending_dma.valid = false;
+                this->pending_dma = PendingDma();
                 this->active_dma = PendingDma();
                 this->dma_inflight = false;
                 this->irq_pending = false;
+                this->reset_pending = false;
                 this->dma_mappings.clear();
                 this->write32_nolock(BAR0_DMA_STATUS, 0);
                 this->write32_nolock(BAR0_DMA_ERROR, DMA_ERR_NONE);
@@ -941,6 +1028,7 @@ void PCIeVfioMemBridge::vfio_server_thread()
     }
 }
 
+/* Factory entry point used by GVSoC to instantiate the component module. */
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
 {
     return new PCIeVfioMemBridge(config);
