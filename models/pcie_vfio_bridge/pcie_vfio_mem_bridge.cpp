@@ -207,6 +207,8 @@ private:
     void process_pending_dma();
     void maybe_trigger_irq(uint32_t ctrl);
 
+    static void done_req(vp::Block *__this, bool active);
+
     uint32_t read32_nolock(uint64_t offset) const;
     void write32_nolock(uint64_t offset, uint32_t value);
     DmaRegs snapshot_dma_regs_nolock() const;
@@ -224,6 +226,7 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
 : vp::Component(conf)
 {
     this->new_master_port("mem", &this->mem_itf);
+    this->done_irq_itf.set_sync_meth(&PCIeVfioMemBridge::done_req);
     this->new_slave_port("done_irq", &this->done_irq_itf);
     this->new_master_port("fetch_en", &this->fetch_enable_itf);
     this->new_master_port("entry_addr", &this->entry_addr_itf);
@@ -462,6 +465,15 @@ void PCIeVfioMemBridge::irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_
     if (start == 0 && count > 0) {
         bridge->msix_vector0_masked = mask;
         std::cout << "MSI-X vector0 " << (mask ? "masked" : "unmasked") << std::endl;
+    }
+}
+
+// this is a gvsoc-side function and it is not tied to the vfu context
+void PCIeVfioMemBridge::done_req(vp::Block *__this, bool active) {
+    PCIeVfioMemBridge *_this = (PCIeVfioMemBridge *)__this;
+    if (active) {//need to connect a PCIe IRQ (MSI-X) also to this event
+        std::cout << "Received end of compute from accelerator"<< std::endl;
+        _this->fetch_enable_itf.sync(false);
     }
 }
 
