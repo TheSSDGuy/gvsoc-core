@@ -203,11 +203,7 @@ private:
     void init_vfio();
     void stop_vfio();
     void vfio_server_thread();
-    void schedule_kick_event();
-    void schedule_reset_event();
-    void process_kick();
     void process_pending_irq();
-    void trigger_system_reset();
 
     uint32_t read32_nolock(uint64_t offset) const;
     void write32_nolock(uint64_t offset, uint32_t value);
@@ -712,41 +708,11 @@ void PCIeVfioMemBridge::irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_
     }
 }
 
-/* Wake the GVSoC thread so it can process BAR-driven work from the VFIO thread. */
-void PCIeVfioMemBridge::schedule_kick_event()
-{
-    gv::Controller::get().engine_lock();
-    if (this->kick_event != nullptr && !this->kick_event->is_enqueued()) {
-        this->event_enqueue(this->kick_event, 1);
-    }
-    gv::Controller::get().engine_unlock();
-}
-
-/* Wake the GVSoC thread so it can issue a global reset outside of the IRQ callback path. */
-void PCIeVfioMemBridge::schedule_reset_event()
-{
-    if (this->reset_event != nullptr && !this->reset_event->is_enqueued()) {
-        this->event_enqueue(this->reset_event, 1);
-    }
-}
 
 /* Dispatch pending BAR-triggered actions from the GVSoC thread context. */
 void PCIeVfioMemBridge::kick_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
-    _this->process_kick();
-}
-
-/* Execute the deferred global reset from the GVSoC thread context. */
-void PCIeVfioMemBridge::reset_handler(vp::Block *__this, vp::ClockEvent *event)
-{
-    PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
-    _this->trigger_system_reset();
-}
-
-/* Consume deferred entry/fetch/DMA updates that were latched by BAR callbacks. */
-void PCIeVfioMemBridge::process_kick()
-{
     PendingDma dma_req;
     bool send_entry = false;
     bool send_fetch = false;
@@ -754,50 +720,52 @@ void PCIeVfioMemBridge::process_kick()
     bool fetch_enable = false;
 
     {
-        std::lock_guard<std::mutex> lock(this->mutex);
+        std::lock_guard<std::mutex> lock(_this->mutex);
 
-        send_entry = this->entry_update_pending;
-        send_fetch = this->fetch_update_pending;
-        entry = static_cast<uint64_t>(this->read32_nolock(BAR0_ENTRY_POINT));
-        fetch_enable = this->read32_nolock(BAR0_FETCH_ENABLE) != 0;
-        this->entry_update_pending = false;
-        this->fetch_update_pending = false;
+        send_entry = _this->entry_update_pending;
+        send_fetch = _this->fetch_update_pending;
+        entry = static_cast<uint64_t>(_this->read32_nolock(BAR0_ENTRY_POINT));
+        fetch_enable = _this->read32_nolock(BAR0_FETCH_ENABLE) != 0;
+        _this->entry_update_pending = false;
+        _this->fetch_update_pending = false;
 
-        if (!this->dma_inflight && this->pending_dma.valid) {
-            dma_req = this->pending_dma;
-            this->pending_dma.valid = false;
+        if (!_this->dma_inflight && _this->pending_dma.valid) {
+            dma_req = _this->pending_dma;
+            _this->pending_dma.valid = false;
         }
     }
 
     if (send_entry) {
-        this->trace.msg(vp::Trace::LEVEL_DEBUG, "ENTRY_POINT written 0x%llx\n", (unsigned long long)entry);
-        this->entry_addr_itf.sync(entry);
+        _this->trace.msg(vp::Trace::LEVEL_DEBUG, "ENTRY_POINT written 0x%llx\n", (unsigned long long)entry);
+        _this->entry_addr_itf.sync(entry);
     }
 
     if (send_fetch) {
-        this->trace.msg(vp::Trace::LEVEL_DEBUG, "FETCH_ENABLE written %d\n", fetch_enable);
-        this->fetch_enable_itf.sync(fetch_enable);
+        _this->trace.msg(vp::Trace::LEVEL_DEBUG, "FETCH_ENABLE written %d\n", fetch_enable);
+        _this->fetch_enable_itf.sync(fetch_enable);
     }
 
     if (dma_req.valid) {
-        this->launch_dma(dma_req);
+        _this->launch_dma(dma_req);
     }
 }
 
-/* Reset the whole GVSoC hierarchy by asserting and releasing the top-level reset. */
-void PCIeVfioMemBridge::trigger_system_reset()
+/* Execute the deferred global reset directly from the event callback. */
+void PCIeVfioMemBridge::reset_handler(vp::Block *__this, vp::ClockEvent *event)
 {
+    PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
+
     {
-        std::lock_guard<std::mutex> lock(this->mutex);
-        if (!this->reset_pending) {
+        std::lock_guard<std::mutex> lock(_this->mutex);
+        if (!_this->reset_pending) {
             return;
         }
-        this->reset_pending = false;
+        _this->reset_pending = false;
     }
 
-    this->trace.msg(vp::Trace::LEVEL_INFO, "Triggering full GVSoC reset after done IRQ\n");
+    _this->trace.msg(vp::Trace::LEVEL_INFO, "Triggering full GVSoC reset after done IRQ\n");
 
-    vp::Block *top = this;
+    vp::Block *top = _this;
     while (top->get_parent() != nullptr) {
         top = top->get_parent();
     }
@@ -861,7 +829,9 @@ void PCIeVfioMemBridge::done_req(vp::Block *__this, bool active)
         _this->reset_pending = true;
     }
 
-    _this->schedule_reset_event();
+    if (_this->reset_event != nullptr && !_this->reset_event->is_enqueued()) {
+        _this->event_enqueue(_this->reset_event, 1);
+    }
 }
 
 /* Serve guest BAR0 MMIO accesses and defer any GVSoC-side work to the simulator thread. */
@@ -931,7 +901,11 @@ ssize_t PCIeVfioMemBridge::bar0_access(vfu_ctx_t *vfu_ctx,
     }
 
     if (schedule_event) {
-        bridge->schedule_kick_event();
+        gv::Controller::get().engine_lock();
+        if (bridge->kick_event != nullptr && !bridge->kick_event->is_enqueued()) {
+            bridge->event_enqueue(bridge->kick_event, 1);
+        }
+        gv::Controller::get().engine_unlock();
     }
 
     return static_cast<ssize_t>(count);
