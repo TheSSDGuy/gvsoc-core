@@ -2,8 +2,8 @@
 
 ## Overview
 
-This module provides a **VFIO-user based PCIe endpoint bridge** between **GVSoC** and **QEMU**.  
-The goal is to allow a simulated SoC inside GVSoC to expose a PCIe device that can be attached to a virtual machine running in QEMU.
+This module implements a **VFIO-user based PCIe endpoint bridge** between **GVSoC** and **QEMU**.
+It allows a simulated accelerator or memory-facing device inside GVSoC to be exposed to a QEMU guest as a PCIe endpoint.
 
 In this setup:
 
@@ -16,89 +16,102 @@ In this setup:
 +-------------------+                                     +------------------+
 ```
 
-The communication happens through **libvfio-user**, which exposes a PCIe device over a UNIX socket.
-
-The QEMU VM sees the device as a **standard PCIe device**, allowing Linux drivers and applications to interact with it.
+The transport layer is handled through **libvfio-user**, while device-side accesses are forwarded to the GVSoC model through native GVSoC interfaces.
 
 ---
 
-# Architecture
+## Architecture
 
-The bridge is implemented in the file:
+The bridge implementation lives in:
 
 ```
 pcie_vfio_mem_bridge.cpp
 ```
 
-This component behaves as a **PCIe endpoint exposed through VFIO-user**.
-
 Main responsibilities:
 
-* Create and manage the **vfio-user server**
-* Expose **PCIe BAR regions**
-* Handle **MMIO transactions**
-* Forward requests between **QEMU and the simulated device**
-* Synchronize execution between GVSoC and QEMU
+- create and manage the **vfio-user** server
+- expose **BAR0** as the control/MMIO region
+- receive MMIO accesses from QEMU through libvfio-user
+- forward DMA requests to the GVSoC memory system through the `mem` IO master port
+- propagate `ENTRY_POINT` and `FETCH_ENABLE` updates to the accelerator-facing GVSoC interfaces
+- report DMA completion through BAR status bits and optional MSI-X
+
+### Ports exposed by the model
+
+- `mem`: GVSoC IO master used for DMA accesses toward the device memory space
+- `done_irq`: wire slave used by the accelerator to signal end-of-compute
+- `fetch_en`: wire master driven from BAR0 `FETCH_ENABLE`
+- `entry_addr`: wire master driven from BAR0 `ENTRY_POINT`
 
 ---
 
-# Execution Model
+## Execution Model
 
-The bridge uses a **blocking model** where:
+The bridge now uses a **split execution model**:
+
+- a dedicated **VFIO thread** runs the libvfio-user event loop
+- the actual **GVSoC-side work** is executed back on the GVSoC thread through clock events
+
+This is important because:
+
+- BAR callbacks from libvfio-user do **not** directly access the GVSoC memory hierarchy
+- MMIO writes only latch state and schedule a GVSoC event when needed
+- DMA requests are executed from the GVSoC side through the `mem` port
+- the VFIO thread remains responsible for transport-side polling, attach/re-attach handling and MSI-X triggering
+
+### High-level flow
 
 1. GVSoC starts the VFIO-user server
-2. QEMU connects through a UNIX socket
-3. GVSoC waits for requests coming from QEMU
+2. QEMU connects to the UNIX socket
+3. QEMU performs BAR writes or DMA setup
+4. the bridge latches the request
+5. a GVSoC event executes the corresponding device-side action
+6. completion is reflected back through BAR status and optional MSI-X
 
-This means that:
-
-**GVSoC will block waiting for QEMU to connect.**
-
-This is expected behaviour.
-
-Typical flow:
-
-```
-Start GVSoC
-      ↓
-VFIO-user server created
-      ↓
-GVSoC waits for connection
-      ↓
-Start QEMU
-      ↓
-QEMU connects to socket
-      ↓
-Simulation proceeds
-```
+The component still waits for the QEMU side to attach during startup.
 
 ---
 
-# Memory Model (Current Status)
+## DMA Model
 
-⚠ **Important**
+The bridge supports two DMA directions:
 
-The **memory integration inside GVSoC is not fully implemented yet.**
+- **host to card**
+- **card to host**
 
-Currently:
+DMA mappings are provided by libvfio-user through `vfu_setup_device_dma()`.
+The bridge resolves guest IOVAs against those mappings and then issues a GVSoC IO request on the `mem` port.
 
-* BAR regions exist
-* MMIO transactions can be received
-* But **memory accesses are not fully connected to the GVSoC memory hierarchy yet**
+Current behavior:
 
-This means that the current implementation is mainly intended for:
-
-* **infrastructure validation**
-* **PCIe protocol integration**
-* **DMA experiments from the host side**
-
-Future work will connect the bridge to the **MAGIA memory system (L2 / TCDM)**.
+- DMA requests are programmed through BAR0 registers
+- only one DMA request can be active at a time
+- completion updates `DMA_STATUS` and `DMA_ERROR`
+- MSI-X vector 0 can be triggered when `DMA_CTRL_IRQ_EN` is set
+- abort cancels a pending request but does not forcibly cancel an already in-flight GVSoC request
 
 ---
 
-# Dependencies
+## Accelerator Integration
 
-This module requires the **libvfio-user** library.
+Two BAR-controlled accelerator hooks are exposed:
+
+- `ENTRY_POINT`: forwarded to `entry_addr`
+- `FETCH_ENABLE`: forwarded to `fetch_en`
+
+In addition, when the accelerator asserts `done_irq`:
+
+- the bridge forces `fetch_en` low
+- the bridge schedules a **full GVSoC reset** by asserting and releasing the top-level reset hierarchy
+
+This behavior is intentional and reflects the current integration model implemented in the code.
+
+---
+
+## Dependencies
+
+This module requires **libvfio-user**.
 
 Repository:
 
@@ -121,74 +134,54 @@ Expected install paths:
 /usr/local/lib/x86_64-linux-gnu
 ```
 
-Compiler flags used in GVSoC:
-
-```
--I/usr/local/include/vfio-user
--L/usr/local/lib/x86_64-linux-gnu
--lvfio-user
-```
+The module CMake file links directly against `vfio-user` and adds the required include path locally.
 
 ---
 
-# GVSoC Integration
+## GVSoC Integration
 
-## 1 — vp_models.cmake modification
+To register the module in the build, add it to:
 
-A modification was introduced in **vp_models.cmake**.
+```cmake
+gvsoc/core/models/CMakeLists.txt
+```
 
-The goal is to allow **child CMakeLists to expose the module name** so that GVSoC can correctly build dynamic modules.
-
-This allows modules to be defined locally without requiring manual duplication of names in parent build files.
-
----
-
-## 2 — gvsoc/core/models/CMakeLists.txt
-
-The module must be added to the build system.
-
-Add the following line:
+with:
 
 ```cmake
 add_subdirectory(pcie_vfio_bridge)
 ```
 
-This registers the module inside the GVSoC build system.
+No extra `vp_models.cmake` modification is required for this module anymore.
 
 ---
 
-# Typical Execution Flow
+## Typical Execution Flow
 
-1. Start GVSoC (VFIO server)
-2. Start QEMU with vfio-user device
-3. QEMU connects to the socket
-4. MMIO and DMA traffic flows between VM and GVSoC
+1. Start GVSoC with the bridge enabled
+2. Start QEMU with a `vfio-user-pci` endpoint connected to the bridge socket
+3. Program BAR0 registers from the guest
+4. Trigger DMA and accelerator-side execution as needed
+5. Observe completion through BAR state, MSI-X and accelerator done signaling
 
 ---
 
 ## Host-side Test Environment
 
-The PCIe VFIO bridge implemented in this module is designed to be used together with the host-side test environment available in the following repository:
+The bridge was designed to work together with the host-side test environment available here:
 
 https://github.com/TheSSDGuy/gvsoc-vfio-test
 
-This repository contains the software components required to interact with the simulated PCIe device exposed by GVSoC, including:
+This repository contains software components useful to validate the end-to-end flow, including:
 
-- a Linux **kernel module** used to expose the VFIO device to user space
-- a **DMA test application** used to validate data transfers between host memory and the simulated device
-- an **ELF loader** used to load binaries into the accelerator memory through PCIe BAR accesses
+- a Linux **kernel module** exposing the VFIO device to user space
+- a **DMA test application**
+- an **ELF loader** using PCIe BAR accesses
 
-### Typical Workflow
+Typical workflow:
 
-1. Start **GVSoC** with the `pcie_vfio_bridge` module enabled.
-2. Start **QEMU** with the `vfio-user-pci` device connected to the GVSoC socket.
-3. Boot the **Debian VM** inside QEMU.
-4. Clone and build the host test repository.
-5. Load the kernel module and run the DMA or ELF loader tests.
-
-This setup enables development and validation of the **complete software stack** before running on real hardware, including:
-
-- Linux driver development
-- PCIe BAR access validation
-- DMA transfers between host and accelerator
-- program loading into the simulated device
+1. start **GVSoC** with the `pcie_vfio_bridge` module enabled
+2. start **QEMU** with the `vfio-user-pci` device connected to the bridge socket
+3. boot the guest VM
+4. build and load the host-side software stack
+5. run DMA and loader tests against the simulated endpoint
