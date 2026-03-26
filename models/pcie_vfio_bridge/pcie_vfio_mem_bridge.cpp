@@ -77,6 +77,14 @@ private:
         uint32_t direction = 0;
     };
 
+    struct ActiveDmaState {
+        uint8_t *host_ptr = nullptr;
+        uint64_t device_addr = 0;
+        uint32_t offset = 0;
+        uint32_t remaining = 0;
+        bool is_write = false;
+    };
+
     struct __attribute__((packed)) MsixCap {
         uint8_t cap_id;
         uint8_t next;
@@ -139,7 +147,7 @@ private:
         DMA_ERR_DEVICE_IO     = 9,
     };
 
-    static constexpr uint32_t DMA_MAGIC_VALUE = 0x44504131;
+    static constexpr uint32_t DMA_MAGIC_VALUE = 0x44504131; //DPA1 
     static constexpr uint32_t MSIX_TABLE_BIR = 0;
     static constexpr uint32_t MSIX_PBA_BIR   = 0;
     static constexpr uint32_t MSIX_TABLE_OFFSET = BAR0_MSIX_TABLE_OFF;
@@ -160,6 +168,7 @@ private:
     bool server_thread_started = false;
 
     uint64_t bar0_size = 0;
+    uint32_t dma_chunk_bytes = 0;
     std::vector<uint8_t> bar0;
     std::string socket_path;
 
@@ -175,11 +184,13 @@ private:
 
     PendingDma pending_dma;
     PendingDma active_dma;
+    ActiveDmaState active_dma_state;
     bool dma_inflight = false;
     std::vector<DmaMapping> dma_mappings;
 
     vp::ClockEvent *kick_event = nullptr;
     vp::ClockEvent *reset_event = nullptr;
+    vp::ClockEvent *dma_event = nullptr;
     vp::IoReq dma_req;
 
     static ssize_t bar0_access(vfu_ctx_t *vfu_ctx,
@@ -193,6 +204,7 @@ private:
     static void irq_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, uint32_t count, bool mask);
     static void kick_handler(vp::Block *__this, vp::ClockEvent *event);
     static void reset_handler(vp::Block *__this, vp::ClockEvent *event);
+    static void dma_handler(vp::Block *__this, vp::ClockEvent *event);
     static void mem_response(vp::Block *__this, vp::IoReq *req);
     static void done_req(vp::Block *__this, bool active);
 
@@ -215,6 +227,7 @@ private:
     void finish_dma_success(uint32_t ctrl);
     void finish_dma_error(uint32_t ctrl, uint32_t error);
     void launch_dma(const PendingDma &req);
+    void submit_next_dma_chunk();
 };
 
 /* Build the bridge component, expose GVSoC interfaces and initialize software-visible state. */
@@ -233,9 +246,14 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
 
     this->socket_path = this->get_js_config()->get_child_str("socket_path");
     this->bar0_size = this->get_js_config()->get_child_int("bar0_size");
+    this->dma_chunk_bytes = static_cast<uint32_t>(this->get_js_config()->get_child_int("dma_chunk_bytes"));
 
     if (this->bar0_size < 0x100) {
         throw std::runtime_error("bar0_size must be at least 0x100 for DMA control/MSI-X registers");
+    }
+
+    if (this->dma_chunk_bytes == 0) {
+        throw std::runtime_error("dma_chunk_bytes must be strictly greater than zero");
     }
 
     this->bar0.resize(this->bar0_size, 0);
@@ -246,6 +264,7 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
 
     this->kick_event = this->event_new(&PCIeVfioMemBridge::kick_handler);
     this->reset_event = this->event_new(&PCIeVfioMemBridge::reset_handler);
+    this->dma_event = this->event_new(&PCIeVfioMemBridge::dma_handler);
 }
 
 /* Stop background activity and release VFIO resources when the component is destroyed. */
@@ -277,6 +296,10 @@ void PCIeVfioMemBridge::stop()
 void PCIeVfioMemBridge::reset(bool active)
 {
     if (!active) {
+        if (this->dma_event->is_enqueued()) {
+            this->event_cancel(this->dma_event);
+        }
+
         std::lock_guard<std::mutex> lock(this->mutex);
         this->reset_registers_nolock();
         this->entry_update_pending = false;
@@ -285,6 +308,7 @@ void PCIeVfioMemBridge::reset(bool active)
         this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
+        this->active_dma_state = ActiveDmaState();
         this->dma_inflight = false;
     }
 }
@@ -402,6 +426,10 @@ void PCIeVfioMemBridge::stop_vfio()
         local_thread.join();
     }
 
+    if (this->dma_event->is_enqueued()) {
+        this->event_cancel(this->dma_event);
+    }
+
     {
         std::lock_guard<std::mutex> lock(this->mutex);
         local_ctx = this->vfu_ctx;
@@ -413,6 +441,7 @@ void PCIeVfioMemBridge::stop_vfio()
         this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
+        this->active_dma_state = ActiveDmaState();
         this->dma_inflight = false;
         this->dma_mappings.clear();
     }
@@ -469,6 +498,7 @@ void PCIeVfioMemBridge::reset_registers_nolock()
     this->write32_nolock(BAR0_FETCH_ENABLE, 0);
     this->pending_dma = PendingDma();
     this->active_dma = PendingDma();
+    this->active_dma_state = ActiveDmaState();
     this->dma_inflight = false;
     this->msix_vector0_masked = false;
 }
@@ -547,6 +577,7 @@ void PCIeVfioMemBridge::finish_dma_success(uint32_t ctrl)
     this->write32_nolock(BAR0_DMA_ERROR, DMA_ERR_NONE);
     this->dma_inflight = false;
     this->active_dma = PendingDma();
+    this->active_dma_state = ActiveDmaState();
     if (ctrl & DMA_CTRL_IRQ_EN) {
         this->irq_pending = true;
     }
@@ -560,12 +591,13 @@ void PCIeVfioMemBridge::finish_dma_error(uint32_t ctrl, uint32_t error)
     this->write32_nolock(BAR0_DMA_ERROR, error);
     this->dma_inflight = false;
     this->active_dma = PendingDma();
+    this->active_dma_state = ActiveDmaState();
     if (ctrl & DMA_CTRL_IRQ_EN) {
         this->irq_pending = true;
     }
 }
 
-/* Translate one latched DMA request into a GVSoC IO request on the memory port. */
+/* Translate one latched DMA request into a chunked GVSoC IO transfer sequence. */
 void PCIeVfioMemBridge::launch_dma(const PendingDma &req)
 {
     if (req.len == 0) {
@@ -608,30 +640,97 @@ void PCIeVfioMemBridge::launch_dma(const PendingDma &req)
             this->write32_nolock(BAR0_DMA_ERROR, errno == EACCES ? DMA_ERR_HOST_PERM : DMA_ERR_HOST_ADDR);
             return;
         }
+
         this->active_dma = req;
+        this->active_dma_state.host_ptr = host_ptr;
+        this->active_dma_state.device_addr = device_addr;
+        this->active_dma_state.offset = 0;
+        this->active_dma_state.remaining = req.len;
+        this->active_dma_state.is_write = is_write;
         this->dma_inflight = true;
     }
 
-    this->dma_req.init();
-    this->dma_req.set_addr(device_addr);
-    this->dma_req.set_size(req.len);
-    this->dma_req.set_data(host_ptr);
-    this->dma_req.set_is_write(is_write);
-
     this->trace.msg(vp::Trace::LEVEL_DEBUG,
-                    "Launching DMA dir=%u host=0x%llx device=0x%llx len=0x%x\n",
+                    "Launching DMA dir=%u host=0x%llx device=0x%llx len=0x%x chunk=0x%x\n",
                     req.direction,
                     (unsigned long long)host_addr,
                     (unsigned long long)device_addr,
-                    req.len);
+                    req.len,
+                    this->dma_chunk_bytes);
+
+    this->submit_next_dma_chunk();
+}
+
+/* Submit one memory chunk of the active DMA sequence and schedule the next one in simulated time. */
+void PCIeVfioMemBridge::submit_next_dma_chunk()
+{
+    uint32_t ctrl = 0;
+    uint32_t total_len = 0;
+    uint32_t chunk_size = 0;
+    uint32_t progress = 0;
+    uint32_t remaining = 0;
+    uint64_t chunk_addr = 0;
+    uint8_t *chunk_data = nullptr;
+    bool is_write = false;
+
+    {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        if (!this->dma_inflight) {
+            return;
+        }
+
+        if (this->active_dma_state.remaining == 0) {
+            ctrl = this->active_dma.ctrl;
+        } else {
+            chunk_size = std::min(this->active_dma_state.remaining, this->dma_chunk_bytes);
+            chunk_addr = this->active_dma_state.device_addr + this->active_dma_state.offset;
+            chunk_data = this->active_dma_state.host_ptr + this->active_dma_state.offset;
+            is_write = this->active_dma_state.is_write;
+
+            this->active_dma_state.offset += chunk_size;
+            this->active_dma_state.remaining -= chunk_size;
+            progress = this->active_dma_state.offset;
+            remaining = this->active_dma_state.remaining;
+            total_len = this->active_dma.len;
+            ctrl = this->active_dma.ctrl;
+        }
+    }
+
+    if (chunk_size == 0) {
+        this->finish_dma_success(ctrl);
+        return;
+    }
+
+    this->dma_req.init();
+    this->dma_req.set_addr(chunk_addr);
+    this->dma_req.set_size(chunk_size);
+    this->dma_req.set_data(chunk_data);
+    this->dma_req.set_is_write(is_write);
+
+    this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                    "DMA chunk addr=0x%llx chunk=0x%x progress=0x%x/0x%x remaining=0x%x\n",
+                    (unsigned long long)chunk_addr,
+                    chunk_size,
+                    progress,
+                    total_len,
+                    remaining);
 
     vp::IoReqStatus status = this->mem_itf.req(&this->dma_req);
 
     if (status == vp::IO_REQ_OK) {
-        this->finish_dma_success(req.ctrl);
-    } else if (status != vp::IO_REQ_PENDING) {
-        this->finish_dma_error(req.ctrl, DMA_ERR_DEVICE_IO);
+        uint64_t latency = this->dma_req.get_full_latency();
+        this->trace.msg(vp::Trace::LEVEL_DEBUG,
+                        "DMA chunk accepted latency=%llu cycles\n",
+                        (unsigned long long)latency);
+        this->event_enqueue(this->dma_event, latency == 0 ? 1 : latency);
+        return;
     }
+
+    if (status == vp::IO_REQ_PENDING) {
+        return;
+    }
+
+    this->finish_dma_error(ctrl, DMA_ERR_DEVICE_IO);
 }
 
 /* Handle a VFIO reset request by restoring bridge state visible to the guest. */
@@ -774,18 +873,18 @@ void PCIeVfioMemBridge::reset_handler(vp::Block *__this, vp::ClockEvent *event)
     top->reset_all(false);
 }
 
-/* Complete an asynchronous memory request when the target answers on the IO port. */
+/* Continue a chunked DMA sequence when an asynchronous memory request completes. */
 void PCIeVfioMemBridge::mem_response(vp::Block *__this, vp::IoReq *req)
 {
     PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
-    PendingDma active;
+    _this->submit_next_dma_chunk();
+}
 
-    {
-        std::lock_guard<std::mutex> lock(_this->mutex);
-        active = _this->active_dma;
-    }
-
-    _this->finish_dma_success(active.ctrl);
+/* Resume a chunked DMA transfer after the latency of the previous accepted request has elapsed. */
+void PCIeVfioMemBridge::dma_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
+    _this->submit_next_dma_chunk();
 }
 
 /* Emit a pending MSI-X interrupt once the VFIO transport is ready to accept it. */

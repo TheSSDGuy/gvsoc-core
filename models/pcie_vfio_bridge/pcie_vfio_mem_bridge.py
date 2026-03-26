@@ -7,13 +7,15 @@ class PCIeVfioMemBridge(gvsoc.systree.Component):
                 parent: gvsoc.systree.Component,
                 name: str,
                 socket_path: str,
-                bar0_size: int):
+                bar0_size: int,
+                dma_chunk_bytes: int=4096):
 
         super().__init__(parent, name)
 
         self.add_properties({
             'socket_path': socket_path,
             'bar0_size': bar0_size,
+            'dma_chunk_bytes': dma_chunk_bytes,
         })
 
         self.set_component('pcie_vfio_bridge.pcie_vfio_mem_bridge')
